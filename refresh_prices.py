@@ -10,6 +10,7 @@ Run from the repo root. Designed to be invoked by GitHub Actions.
 Idempotent: safe to re-run; if no tickers have new data, file is unchanged.
 """
 import json
+import math
 import re
 import sys
 from datetime import datetime, timezone, timedelta
@@ -39,6 +40,11 @@ def fetch_returns(tickers: list[str]) -> dict:
             t = yf.Ticker(tkr)
             hist = t.history(period="3y", auto_adjust=True)
 
+            # Some foreign listings return a trailing row with a NaN close
+            # (session still open / not yet settled at fetch time). Drop any
+            # such rows so we never compute off a NaN price.
+            hist = hist[hist["Close"].notna()]
+
             if len(hist) < 5:
                 failed.append((tkr, "insufficient history"))
                 continue
@@ -60,9 +66,14 @@ def fetch_returns(tickers: list[str]) -> dict:
                     return None
                 return (last_close / prior["Close"].iloc[-1] - 1) * 100
 
+            ret_ytd = _safe_round(ytd)
+            if ret_ytd is None:
+                failed.append((tkr, "NaN return computed"))
+                continue
+
             row = {
                 "last": round(float(last_close), 2),
-                "ret_ytd": round(float(ytd), 2),
+                "ret_ytd": ret_ytd,
                 "ret_3m": _safe_round(back(91)),
                 "ret_6m": _safe_round(back(182)),
                 "ret_1y": _safe_round(back(365)),
@@ -84,7 +95,12 @@ def fetch_returns(tickers: list[str]) -> dict:
 
 
 def _safe_round(v):
-    return None if v is None else round(float(v), 2)
+    if v is None:
+        return None
+    v = float(v)
+    if math.isnan(v) or math.isinf(v):
+        return None
+    return round(v, 2)
 
 
 def recompute_bubble_perf(bubble: dict, ticker_returns: dict, spy: dict) -> None:
@@ -97,7 +113,10 @@ def recompute_bubble_perf(bubble: dict, ticker_returns: dict, spy: dict) -> None
         valid = [
             ticker_returns[t][key]
             for t in tickers
-            if t in ticker_returns and ticker_returns[t].get(key) is not None
+            if t in ticker_returns
+            and ticker_returns[t]
+            and ticker_returns[t].get(key) is not None
+            and not (isinstance(ticker_returns[t][key], float) and math.isnan(ticker_returns[t][key]))
         ]
         if valid:
             avg = sum(valid) / len(valid)
@@ -162,8 +181,10 @@ def main() -> int:
     for b in payload["bubbles"]:
         recompute_bubble_perf(b, merged, spy)
 
-    # Re-embed the payload
-    new_payload_str = json.dumps(payload, separators=(",", ":"))
+    # Re-embed the payload. allow_nan=False turns any NaN/Infinity that slips
+    # through into a loud CI failure instead of silently shipping invalid
+    # JSON that breaks JSON.parse() on the live page.
+    new_payload_str = json.dumps(payload, separators=(",", ":"), allow_nan=False)
     new_html = (
         html[:m.start(2)]
         + new_payload_str
